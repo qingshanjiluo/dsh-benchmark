@@ -1,232 +1,332 @@
 /**
- * dsh-benchmark — 性能基准测试
- *
- * 功能：
- * 1. 运行性能基准测试
- * 2. 对比历史数据
- * 3. 多次运行取平均
- * 4. 生成性能报告
- * 5. 性能回归检测
- *
- * 工具：bench_run, bench_compare, bench_history, bench_report
- * 命令：/bench
- * 配置：enabled, iterations, warmup, outputFile
+ * Deterministic benchmark analysis for DeepSeek Harness. The plugin runs
+ * nothing and times nothing: `bench_stats` summarizes one supplied sample
+ * list, `bench_compare` contrasts two supplied sample lists, and
+ * `bench_report` renders a Markdown report over a supplied set of runs
+ * (either structured JSON or a JSON string). All three tools are pure
+ * functions of their arguments, so results are fully reproducible and the
+ * test suite never touches the network, filesystem, or a subprocess.
+ * @module @qingshanjiluo/dsh-benchmark
  */
-import { execSync } from 'node:child_process';
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
-import { z } from 'zod';
 
-export const name = 'dsh-benchmark';
-export const inject = ['settings', 'tools', 'commands'];
+import type { Context } from '@deepseek-ai/cordis'
+import { defineTool } from '@deepseek-ai/dsh-tools'
+import z from '@deepseek-ai/schemastery'
 
-const configSchema = z.object({
-  enabled: z.boolean().default(true),
-  iterations: z.number().int().min(1).max(1000).default(100),
-  warmup: z.number().int().min(0).max(100).default(10),
-  outputFile: z.string().default('.bench-history.json'),
-  regressionThreshold: z.number().default(10),
-});
+export const name = 'dsh-benchmark'
+export const inject = ['tools']
 
-type Config = z.infer<typeof configSchema>;
-
-interface BenchResult {
-  name: string;
-  ops: number;
-  mean: number;
-  min: number;
-  max: number;
-  p75: number;
-  p99: number;
-  samples: number;
-  timestamp: string;
+/** Deployment presentation settings for the analysis tools. */
+export interface Config {
+  /**
+   * Decimal places used when rounding computed statistics and rendered
+   * report numbers. Values outside 0..12 are clamped.
+   */
+  precision: number
+  /** Heading rendered at the top of the Markdown report. */
+  reportHeading: string
 }
 
-interface BenchHistory {
-  name: string;
-  results: BenchResult[];
+/** Schemastery configuration for the benchmark analyzer. */
+export const Config: z<Config> = z.object({
+  precision: z.number().default(4),
+  reportHeading: z.string().default('Benchmark Report'),
+})
+
+/** One labeled measurement list, as supplied to {@link summarize}. */
+interface BenchRun {
+  name: string
+  samples: number[]
 }
 
-function loadHistory(filePath: string): BenchHistory[] {
-  if (!existsSync(filePath)) return [];
-  try { return JSON.parse(readFileSync(filePath, 'utf-8')); } catch { return []; }
+/** Summary statistics for one sample list. */
+interface Stats {
+  n: number
+  mean: number
+  median: number
+  p95: number
+  min: number
+  max: number
+  stdev: number
 }
 
-function saveHistory(filePath: string, data: BenchHistory[]) {
-  writeFileSync(filePath, JSON.stringify(data, null, 2));
+/**
+ * Clamp the configured precision into a safe digit budget.
+ * @param precision - raw configured value.
+ * @returns Integer digits in 0..12; falls back to 4 when not finite.
+ */
+function clampDigits(precision: number): number {
+  if (!Number.isFinite(precision)) return 4
+  return Math.min(Math.max(Math.trunc(precision), 0), 12)
 }
 
-function formatOps(ops: number): string {
-  if (ops >= 1e9) return `${(ops / 1e9).toFixed(2)} Gops/s`;
-  if (ops >= 1e6) return `${(ops / 1e6).toFixed(2)} Mops/s`;
-  if (ops >= 1e3) return `${(ops / 1e3).toFixed(2)} Kops/s`;
-  return `${ops.toFixed(2)} ops/s`;
+/**
+ * Round to the configured digit budget.
+ * @param value - number to round.
+ * @param digits - clamp()ed digit budget.
+ * @returns Rounded number.
+ */
+function roundTo(value: number, digits: number): number {
+  const factor = Math.pow(10, digits)
+  return Math.round(value * factor) / factor
 }
 
-function runMicroBench(fn: string, iterations: number, warmup: number): BenchResult {
-  const samples: number[] = [];
-  for (let i = 0; i < warmup; i++) { try { eval(fn); } catch {} }
-  for (let i = 0; i < iterations; i++) {
-    const start = performance.now();
-    try { eval(fn); } catch {}
-    samples.push(performance.now() - start);
+/**
+ * Validate and sort a caller-supplied sample list ascending.
+ * @param label - identifier to name in error messages.
+ * @param samples - raw samples.
+ * @returns A sorted copy of the samples.
+ */
+function sortedSamples(label: string, samples: readonly number[]): number[] {
+  if (!Array.isArray(samples) || samples.length === 0) {
+    throw new Error(`bench: "${label}" requires at least one sample`)
   }
-  samples.sort((a, b) => a - b);
-  const mean = samples.reduce((a, b) => a + b, 0) / samples.length;
+  for (let i = 0; i < samples.length; i++) {
+    const v = samples[i]
+    if (typeof v !== 'number' || !Number.isFinite(v)) {
+      throw new Error(`bench: "${label}" sample ${i} is not a finite number`)
+    }
+  }
+  return [...samples].sort((a, b) => a - b)
+}
+
+/**
+ * Summarize one sample list with deterministic statistics: mean, median
+ * (average of the two middles for even counts), nearest-rank p95 on the
+ * ascending sort, min, max, and population standard deviation.
+ * @param label - benchmark name for error messages.
+ * @param samples - raw samples (typically durations in ms).
+ * @param digits - rounding budget for computed fields.
+ * @returns Summary statistics with `n` equal to the sample count.
+ */
+function summarize(label: string, samples: readonly number[], digits: number): Stats {
+  const sorted = sortedSamples(label, samples)
+  const n = sorted.length
+  const sum = sorted.reduce((acc, v) => acc + v, 0)
+  const mean = sum / n
+  const mid = Math.floor(n / 2)
+  const median = n % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+  const p95 = sorted[Math.max(0, Math.ceil(0.95 * n) - 1)]
+  const variance = sorted.reduce((acc, v) => acc + (v - mean) * (v - mean), 0) / n
   return {
-    name: fn.substring(0, 50),
-    ops: Math.round(1000 / mean),
-    mean: Math.round(mean * 1000) / 1000,
-    min: Math.round(samples[0] * 1000) / 1000,
-    max: Math.round(samples[samples.length - 1] * 1000) / 1000,
-    p75: Math.round(samples[Math.floor(samples.length * 0.75)] * 1000) / 1000,
-    p99: Math.round(samples[Math.floor(samples.length * 0.99)] * 1000) / 1000,
-    samples: samples.length,
-    timestamp: new Date().toISOString(),
-  };
-}
-
-function detectBenchmarkCommand(): string | null {
-  const pkgPath = 'package.json';
-  if (existsSync(pkgPath)) {
-    const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8'));
-    if (pkg.scripts?.bench) return 'npm run bench';
-    if (pkg.scripts?.benchmark) return 'npm run benchmark';
+    n,
+    mean: roundTo(mean, digits),
+    median: roundTo(median, digits),
+    p95: roundTo(p95, digits),
+    min: sorted[0],
+    max: sorted[n - 1],
+    stdev: roundTo(Math.sqrt(variance), digits),
   }
-  if (existsSync('Cargo.toml')) return 'cargo bench';
-  if (existsSync('go.mod')) return 'go test -bench=. -benchmem';
-  return null;
 }
 
-export function apply(ctx: any, config: Config) {
-  if (!config.enabled) return;
+/**
+ * Coerce the report input — a structured array or a JSON string — into a
+ * list of runs and validate every entry.
+ * @param input - caller-supplied runs value.
+ * @returns Validated runs in supplied order.
+ */
+function parseRuns(input: unknown): BenchRun[] {
+  let value: unknown = input
+  if (typeof value === 'string') {
+    try {
+      value = JSON.parse(value)
+    } catch (cause) {
+      throw new Error(`bench_report: runs string is not valid JSON: ${(cause as Error).message}`)
+    }
+  }
+  if (!Array.isArray(value)) {
+    throw new Error('bench_report: runs must be an array of {name, samples} or a JSON string encoding one')
+  }
+  return value.map((entry: unknown, index: number) => {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw new Error(`bench_report: run ${index} must be an object with name and samples`)
+    }
+    const record = entry as Record<string, unknown>
+    if (typeof record.name !== 'string' || record.name.trim().length === 0) {
+      throw new Error(`bench_report: run ${index} needs a non-empty string name`)
+    }
+    if (!Array.isArray(record.samples)) {
+      throw new Error(`bench_report: run "${record.name}" needs a samples array`)
+    }
+    return { name: record.name, samples: record.samples as number[] }
+  })
+}
 
-  ctx.tools.register({
-    name: 'bench_run',
-    description: '运行性能基准测试',
-    parameters: z.object({
-      command: z.string().optional().describe('基准测试命令'),
-      fn: z.string().optional().describe('内联基准函数'),
-      iterations: z.number().optional(),
-    }),
-    async execute({ command, fn, iterations }: any) {
-      const iters = iterations || config.iterations;
+/**
+ * Render the Markdown report: a rank-ordered statistics table plus totals.
+ * Ranking is by mean ascending, ties broken by name for determinism.
+ * @param runs - validated runs.
+ * @param digits - rounding budget.
+ * @param heading - configured report title.
+ * @returns Markdown text and the run count.
+ */
+function buildReport(runs: readonly BenchRun[], digits: number, heading: string): { markdown: string; runCount: number } {
+  const title = heading.replace(/\r?\n/g, ' ').trim() || 'Benchmark Report'
+  const lines: string[] = [`# ${title}`, '']
+  if (runs.length === 0) {
+    lines.push('No benchmark runs supplied.')
+    return { markdown: lines.join('\n'), runCount: 0 }
+  }
+  const rows = runs.map(run => ({ run, stats: summarize(run.name, run.samples, digits) }))
+  rows.sort((a, b) =>
+    a.stats.mean - b.stats.mean ||
+    (a.run.name < b.run.name ? -1 : a.run.name > b.run.name ? 1 : 0),
+  )
+  lines.push('| Rank | Name | n | mean | median | p95 | min | max | stdev |')
+  lines.push('|-----:|------|--:|-----:|-------:|----:|----:|----:|------:|')
+  rows.forEach((row, index) => {
+    const s = row.stats
+    lines.push(
+      `| ${index + 1} | ${row.run.name} | ${s.n} | ${s.mean} | ${s.median} | ${s.p95} | ${s.min} | ${s.max} | ${s.stdev} |`,
+    )
+  })
+  const totalSamples = rows.reduce((acc, row) => acc + row.stats.n, 0)
+  const best = rows[0]
+  lines.push('')
+  lines.push(`- Total runs: ${runs.length}`)
+  lines.push(`- Total samples: ${totalSamples}`)
+  lines.push(`- Best mean: \`${best.run.name}\` (${best.stats.mean})`)
+  return { markdown: lines.join('\n'), runCount: runs.length }
+}
 
-      if (fn) {
-        const result = runMicroBench(fn, iters, config.warmup);
-        const history = loadHistory(resolve(config.outputFile));
-        const existing = history.find(h => h.name === result.name);
-        if (existing) existing.results.push(result);
-        else history.push({ name: result.name, results: [result] });
-        saveHistory(resolve(config.outputFile), history);
-        return result;
-      }
+/**
+ * Register the benchmark analysis tools on `ctx.tools`.
+ * @param ctx - registrant context carrying the tool registry.
+ * @param config - deployment's explicit presentation settings.
+ */
+export function apply(ctx: Context, config: Config): void {
+  const digits = clampDigits(config.precision)
 
-      const cmd = command || detectBenchmarkCommand();
-      if (!cmd) return { error: '未找到基准测试命令，请提供 command 参数' };
-
-      try {
-        const output = execSync(cmd, { encoding: 'utf-8', timeout: 300000, stdio: 'pipe' });
-        return { command: cmd, output: output.substring(0, 2000), success: true };
-      } catch (e: any) {
-        return { error: e.message };
-      }
+  ctx.tools.register(defineTool({
+    name: 'bench_stats',
+    description:
+      'Summarize one benchmark run from samples you supply (numbers, typically ' +
+      'durations in ms). Returns mean, median, nearest-rank p95, min, max, ' +
+      'population stdev, and the sample count n. Pure analysis: nothing is ' +
+      'executed or timed, and the same samples always produce the same result.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Label for this benchmark run.' },
+      samples: {
+        type: 'array',
+        required: true,
+        description: 'Measured values, e.g. latencies in milliseconds. Must contain at least one finite number.',
+        items: { type: 'number' },
+      },
     },
-  });
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          n: { type: 'integer', required: true, description: 'Number of samples.' },
+          mean: { type: 'number', required: true, description: 'Arithmetic mean, rounded to the configured precision.' },
+          median: { type: 'number', required: true, description: 'Median (mean of the two middles for even n).' },
+          p95: { type: 'number', required: true, description: 'Nearest-rank 95th percentile of the ascending sort.' },
+          min: { type: 'number', required: true, description: 'Smallest sample.' },
+          max: { type: 'number', required: true, description: 'Largest sample.' },
+          stdev: { type: 'number', required: true, description: 'Population standard deviation.' },
+        },
+      },
+      render: (args, value) => [{
+        type: 'text',
+        text:
+          `${args.name}: n=${value.n} mean=${value.mean} median=${value.median} ` +
+          `p95=${value.p95} min=${value.min} max=${value.max} stdev=${value.stdev}`,
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const { name: label, samples } = args
+      const { n, mean, median, p95, min, max, stdev } = summarize(label, samples, digits)
+      return Promise.resolve({ n, mean, median, p95, min, max, stdev })
+    },
+  }))
 
-  ctx.tools.register({
+  ctx.tools.register(defineTool({
     name: 'bench_compare',
-    description: '对比两次基准测试结果',
-    parameters: z.object({
-      name: z.string().describe('基准名称'),
-      limit: z.number().default(2),
-    }),
-    async execute({ name, limit }: any) {
-      const history = loadHistory(resolve(config.outputFile));
-      const bench = history.find(h => h.name === name || h.name.includes(name));
-      if (!bench || bench.results.length < 2) return { error: `未找到足够的历史数据: ${name}` };
-
-      const recent = bench.results.slice(-limit);
-      const baseline = recent[0];
-      const current = recent[recent.length - 1];
-      const change = ((current.mean - baseline.mean) / baseline.mean * 100);
-
-      return {
-        name,
-        baseline: { ops: formatOps(baseline.ops), mean: `${baseline.mean}ms`, timestamp: baseline.timestamp },
-        current: { ops: formatOps(current.ops), mean: `${current.mean}ms`, timestamp: current.timestamp },
-        change: `${change > 0 ? '+' : ''}${change.toFixed(1)}%`,
-        regression: change > config.regressionThreshold,
-      };
+    description:
+      'Compare two benchmark runs from supplied samples: a is the baseline, b is ' +
+      'the current run. Returns delta (mean of b minus mean of a), deltaPct ' +
+      '(delta as a percentage of the baseline mean), and winner — "a", "b", or ' +
+      '"tie"; lower mean wins because samples are durations. Needs non-empty ' +
+      'finite sample lists and a baseline mean greater than zero.',
+    parameters: {
+      name: { type: 'string', required: true, description: 'Label for what is being compared.' },
+      aSamples: {
+        type: 'array',
+        required: true,
+        description: 'Baseline samples (finite numbers).',
+        items: { type: 'number' },
+      },
+      bSamples: {
+        type: 'array',
+        required: true,
+        description: 'Current samples (finite numbers).',
+        items: { type: 'number' },
+      },
     },
-  });
-
-  ctx.tools.register({
-    name: 'bench_history',
-    description: '查看基准测试历史',
-    parameters: z.object({
-      name: z.string().optional(),
-      limit: z.number().default(10),
-    }),
-    async execute({ name, limit }: any) {
-      const history = loadHistory(resolve(config.outputFile));
-      if (name) {
-        const bench = history.find(h => h.name.includes(name));
-        if (!bench) return { error: `未找到: ${name}` };
-        return { name: bench.name, results: bench.results.slice(-limit) };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          delta: { type: 'number', required: true, description: 'mean(b) - mean(a); positive means b is slower.' },
+          deltaPct: { type: 'number', required: true, description: 'delta / mean(a) * 100.' },
+          winner: { type: 'string', required: true, enum: ['a', 'b', 'tie'], description: 'Which side has the lower mean.' },
+        },
+      },
+      render: (args, value) => [{
+        type: 'text',
+        text:
+          `${args.name}: delta=${value.delta} (${value.deltaPct > 0 ? '+' : ''}${value.deltaPct}%), ` +
+          `winner=${value.winner}` +
+          (value.winner === 'a' ? ' (baseline a is faster)' : value.winner === 'b' ? ' (current b is faster)' : ' (means equal)'),
+      }],
+    },
+    isConcurrencySafe: () => true,
+    execute(args) {
+      const { name: label, aSamples, bSamples } = args
+      const a = summarize(label + ' (a)', aSamples, digits)
+      const b = summarize(label + ' (b)', bSamples, digits)
+      if (a.mean === 0) {
+        throw new Error(`bench_compare: baseline mean of "${label}" is 0; deltaPct is undefined`)
       }
-      return { benchmarks: history.map(h => ({ name: h.name, runs: h.results.length, latest: h.results[h.results.length - 1] })) };
+      const delta = roundTo(b.mean - a.mean, digits)
+      const deltaPct = roundTo(((b.mean - a.mean) / a.mean) * 100, digits)
+      const winner: 'a' | 'b' | 'tie' = a.mean < b.mean ? 'a' : b.mean < a.mean ? 'b' : 'tie'
+      return Promise.resolve({ delta, deltaPct, winner })
     },
-  });
+  }))
 
-  ctx.tools.register({
+  ctx.tools.register(defineTool({
     name: 'bench_report',
-    description: '生成性能报告',
-    parameters: z.object({}),
-    async execute() {
-      const history = loadHistory(resolve(config.outputFile));
-      if (history.length === 0) return { message: '暂无基准数据' };
-
-      const report = history.map(h => {
-        const latest = h.results[h.results.length - 1];
-        return { name: h.name, ops: formatOps(latest.ops), mean: `${latest.mean}ms`, runs: h.results.length };
-      });
-
-      return { report, total: history.length };
+    description:
+      'Render a Markdown report over supplied benchmark runs. Pass runs either ' +
+      'directly as a JSON array of {name, samples:[number]} objects or as a ' +
+      'string containing that JSON. Each run is summarized (n, mean, median, ' +
+      'p95, min, max, stdev), ranked by mean ascending, and printed as a table ' +
+      'with totals. Pure text analysis: no commands are run and no clocks read.',
+    parameters: {
+      runs: {
+        type: 'json',
+        required: true,
+        description: 'Array of {name, samples:[number]} runs, or a JSON string encoding that array.',
+      },
     },
-  });
-
-  ctx.commands.register({
-    name: 'bench',
-    description: '性能基准测试',
-    async execute(args: string) {
-      const parts = args.trim().split(/\s+/);
-      const action = parts[0] || 'run';
-      const param = parts.slice(1).join(' ');
-
-      if (action === 'run') {
-        const result = await ctx.tools.execute('bench_run', { command: param || undefined });
-        return { content: result.error || `基准测试完成: ${JSON.stringify(result)}` };
-      }
-      if (action === 'compare') {
-        const result = await ctx.tools.execute('bench_compare', { name: param });
-        return { content: JSON.stringify(result, null, 2) };
-      }
-      if (action === 'history') {
-        const result = await ctx.tools.execute('bench_history', { name: param || undefined });
-        return { content: JSON.stringify(result, null, 2) };
-      }
-      if (action === 'report') {
-        const result = await ctx.tools.execute('bench_report', {});
-        return { content: JSON.stringify(result, null, 2) };
-      }
-      return { content: '用法: /bench [run|compare|history|report] [参数]' };
+    output: {
+      schema: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          runCount: { type: 'integer', required: true, description: 'Number of runs in the report.' },
+          markdown: { type: 'string', required: true, description: 'Complete Markdown report text.' },
+        },
+      },
+      render: (_args, value) => [{ type: 'text', text: value.markdown }],
     },
-  });
-
-  ctx.settings.register({
-    title: 'benchmark',
-    description: '性能基准测试',
-    config: configSchema,
-  });
+    isConcurrencySafe: () => true,
+    execute(args) {
+      return Promise.resolve(buildReport(parseRuns(args.runs), digits, config.reportHeading))
+    },
+  }))
 }

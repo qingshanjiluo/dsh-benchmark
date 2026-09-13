@@ -1,5 +1,9 @@
-# cordis.patch.yml
-# Minimal loader configuration for DSH plugin
-loader:
-  entry: dist/index.js
-  format: esm
+# dsh-benchmark bundle layer: inserts the host tool plugin into a profile's
+# layer stack. Install with:
+#   npx -y @deepseek-ai/dsh plugin --profile web add @qingshanjiluo/dsh-benchmark
+- insert:
+    - id: benchmark
+      name: '@qingshanjiluo/dsh-benchmark'
+      config:
+        precision: 4
+        reportHeading: Benchmark Report
